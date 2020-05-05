@@ -1,13 +1,54 @@
 #include <Arduino.h>
 #include "testData.h"
+#include "arrayProcessing.h"
+#include <arduinoFFT.h>
 
 #define bufferSize 512
+#define singleSize (bufferSize / 2)
 
 double pytData[bufferSize*2];
 double copyData[bufferSize*2];
 
 double acclPyt[bufferSize];
 double gyroPyt[bufferSize];
+
+double acclSingleFFT[singleSize];
+double gyroSingleFFT[singleSize];
+
+// FFT reel og imaginær array
+double realFFT[bufferSize];
+double imagFFT[bufferSize];
+
+// Aktivitets typer (som numbereret liste via enum)
+typedef enum {
+	UNKNOWN, // 0 - Ukendt aktivitet
+	RUN_WALK, // 1 - Løb eller gang aktivitet
+	RUN, // 2 - Løb
+	WALK, // 3 - Gang
+	BIKE, // 4 - Cykling med ukendt hastighed
+	BIKE_SLOW, // 5 - Langsom cykling
+	BIKE_FAST // 6 - Hurtig cykling
+} activityTypes;
+
+// Samplerate i Hz
+#define fs 100
+// Frekvens i Hz hvor over og under sammen skal sammenlignes
+#define sumFreq 8
+uint16_t fftIndexSummed = ((bufferSize / fs) * sumFreq) + 1;
+
+// Peak detektion threshold
+#define acclPeakThreshold 0.65
+#define gyroPeakThreshold 0.65 
+// Peak detektion timeout
+#define acclPeakTimeout 60
+#define gyroPeakTimeout 15
+// Rotationer per minut for hurtig cykling
+#define fastBikeSPM 155
+// Skridt per minut for løb
+#define runSPM 130
+
+
+arduinoFFT FFT = arduinoFFT(); // FFT klasse
 
 // Beregn Pythagoras bevægelsesvektor fra x, y og z
 double calculatePythagoras(int16_t x, int16_t y, int16_t z) {
@@ -16,90 +57,94 @@ double calculatePythagoras(int16_t x, int16_t y, int16_t z) {
 	return pythagoras;
 }
 
-// Kopier double array til double array
-void copyArray(double *fromArray, double *toArray, int16_t arrayLength) {
-	for (uint16_t i = 0; i < arrayLength; i++) {
-		*(toArray+i) = *(fromArray+i);
-	}
+// Udfør FFT på data og kopier absolut single sided FFT til absFFTout array (output array (absFFTout) længde er (arrayLength/2)+1)
+void getAbsoluteSingleFFT(double *rawDataIn, double *absFFTout, uint16_t arrayLength) {
+	// Kopier data til FFT array
+	copyArray(rawDataIn, realFFT, arrayLength); 
+	// Reset alle værdier i imagFFT (nødvendigt ifølge arduinoFFT bibliotek)
+	setArrayTo(imagFFT, arrayLength, 0); 
+	// Udfør FFT
+	FFT.Compute(realFFT, imagFFT, arrayLength, FFT_FORWARD);
+	// Beregn absolute værdi af FFT 
+	absComplexArray(realFFT, imagFFT, arrayLength); 
+	// Kopier data til FFT array
+	copyArray(realFFT, absFFTout, (arrayLength / 2)); 
 }
 
-// Finder maksimal værdi i array
-double maxInArray(double *buffPointer, uint16_t buffSize) {
-	double maxValue = *(buffPointer);
-	#ifdef printFunc_maxInArray
-		uint16_t maxIndex = 0;
-	#endif
-	for (uint16_t i = 1; i < buffSize; i++) {
-		if (maxValue < *(buffPointer+i)) {
-			maxValue = *(buffPointer+i);
-			#ifdef printFunc_maxInArray
-				maxIndex = i;
-			#endif
-		}
+// Estimer aktivitet baseret på summen af frekvensindhold over og under hzIndex
+uint8_t estimateActivity(double *acclSumBelow, double *acclSumAbove, double *gyroSumBelow, double *gyroSumAbove) {
+	if ((*acclSumAbove > *acclSumBelow) && (*gyroSumAbove > *gyroSumBelow)) {
+		#ifdef printFunc_estimateActivity
+			Serial.println("estimateActivity(), Activity is RUN_WALK");
+		#endif
+		return RUN_WALK;
+	} else if ((*acclSumAbove < *acclSumBelow) && (*gyroSumAbove < *gyroSumBelow)) {
+		#ifdef printFunc_estimateActivity
+			Serial.println("estimateActivity(), Activity is BIKE");
+		#endif
+		return BIKE;
 	}
-	#ifdef printFunc_maxInArray
-		Serial.print("maxInArray(), max is: ");
-		Serial.print(maxValue);
-		Serial.print(" at index: ");
-		Serial.println(maxIndex);
+	#ifdef printFunc_estimateActivity
+		Serial.println("estimateActivity(), Activity is UNKNOWN");
 	#endif
-	return maxValue;	
+	return UNKNOWN;
 }
 
-// Finder minimal værdi i array
-double minInArray(double *buffPointer, uint16_t buffSize) {
-	double minValue = *(buffPointer);
-	Serial.println(minValue);
-	#ifdef printFunc_maxInArray
-		uint16_t minIndex = 0;
+// Korriger tidligere estimeret aktivitet
+uint8_t specifyActivity(uint8_t activity, int16_t peaks) {
+	#ifdef printFunc_specifyActivity
+		Serial.print("specifyActivity(), Specified activity is: ");
 	#endif
-	for (uint16_t i = 1; i < buffSize; i++) {
-		if (minValue > *(buffPointer+i)) {
-			Serial.print(minValue);
-			Serial.print(" > ");
-			Serial.println(*(buffPointer+i));
-			minValue = *(buffPointer+i);
-			if ((uint16_t)minValue == 0) {
-				Serial.print("0 at: ");
-				Serial.println(i);
+	switch (activity) {
+		case BIKE: {
+			float spinsPerMin = ((float)peaks / 5.0f) * 60.0f;
+			#ifdef printFunc_specifyActivity
+				Serial.print("Spins per min is: ");
+				Serial.println(spinsPerMin);
+			#endif	
+			if (spinsPerMin > fastBikeSPM) {
+				#ifdef printFunc_specifyActivity
+					Serial.println("FAST BIKE");
+				#endif
+				activity = BIKE_FAST;
+			} else {
+				#ifdef printFunc_specifyActivity
+					Serial.println("SLOW BIKE");
+				#endif				
+				activity = BIKE_SLOW;
 			}
-			#ifdef printFunc_maxInArray
-				minIndex = i;
-			#endif
-		}
+		} break;
+		case RUN_WALK: {
+			float stepsPerMin = (((float)peaks * 2.0f) / 5.0f) * 60.0f;
+			#ifdef printFunc_specifyActivity
+				Serial.print("Steps per min is: ");
+				Serial.println(stepsPerMin);
+			#endif	
+			if (stepsPerMin > runSPM) {
+				#ifdef printFunc_specifyActivity
+					Serial.println("RUN");
+				#endif				
+				activity = RUN;
+			} else {
+				#ifdef printFunc_specifyActivity
+					Serial.println("WALK");
+				#endif				
+				activity = WALK;
+			}
+		} break;
 	}
-	#ifdef printFunc_minInArray
-		Serial.print("minInArray(), min is: ");
-		Serial.print(minValue);
-		Serial.print(" at index: ");
-		Serial.println(minIndex);
-	#endif
-	return minValue;
+	return activity;
 }
-
-// Bereng summen af alle datapunkter i et array fra startIndex til endIndex. endIndex bør ikke overstige størrelsen af arrayet. startindex er inklusiv, endIndex er eksklusiv
-double arraySum(double *arrayPointer, uint16_t startIndex, uint16_t endIndex) {
-	double sumOfArray = 0;
-	for (uint16_t i = startIndex; i < endIndex; i++) {
-		sumOfArray = sumOfArray + *(arrayPointer+i);
-	}
-	#ifdef printFunc_arraySum
-		Serial.print("arraySum(), Finding sum, with start/stop and sum: ");
-		Serial.print(startIndex);
-		Serial.print(" ");
-		Serial.print(endIndex);
-		Serial.print(" ");
-		Serial.println(sumOfArray);
-	#endif
-	return sumOfArray;
-}
-
 
 void setup() {
 	Serial.begin(115200);
 	Serial.println("Starting compare!");
 
+
+	Serial.println("-----------------------------");
 	Serial.println("Comparing MATLAB Pythagoras and calculated Pythagoras...");
+	Serial.println("-----------------------------");
+
 	uint16_t pytIndex = 0;
 	for (uint16_t i = 0; i < bufferSize*6; i = i + 6) {
 		pytData[pytIndex] = calculatePythagoras(rawDataOut[i], rawDataOut[i+1], rawDataOut[i+2]);
@@ -121,7 +166,10 @@ void setup() {
 	Serial.println("Done!");
 
 
+	Serial.println("-----------------------------");
 	Serial.println("Tjekking copy array function...");
+	Serial.println("-----------------------------");
+
 	copyArray(pytData, copyData, bufferSize*2);
 	for (uint16_t i = 0; i < bufferSize*2; i++) {
 		double original = (int16_t)pytData[i];
@@ -138,9 +186,12 @@ void setup() {
 	Serial.println("Done!");
 
 
+	Serial.println("-----------------------------");
 	Serial.println("Tjekking min/max...");
+	Serial.println("-----------------------------");
+
 	uint16_t dataIndex = 0;
-	for (uint16_t i = 0; i < bufferSize; i = i + 6) {
+	for (uint16_t i = 0; i < bufferSize; i++) {
 		acclPyt[i] = pytData[dataIndex];
 		gyroPyt[i] = pytData[dataIndex + 1];
 		dataIndex = dataIndex + 2;
@@ -151,52 +202,140 @@ void setup() {
 	Serial.print("Value at acclPyt + 1: ");
 	Serial.println(*(arryPointer+1));
 
-	double matlabAcclMin = aMinMax[0];
-	double matlabAcclMax = aMinMax[2];
-	double matlabGyroMin = aMinMax[2];
+	double matlabAcclMax = aMinMax[1];
 	double matlabGyroMax = aMinMax[3];
 
-	Serial.print("MATLAB min/max: ");
-	Serial.print(matlabAcclMin);
-	Serial.print(" ");
+	// Find max i accelerometerdata
+	double adataMax = maxInArray(acclPyt, bufferSize);
+	// Find max i gyroskop data
+	double gdataMax = maxInArray(gyroPyt, bufferSize);
+
+	Serial.print("MATLAB max: ");
 	Serial.print(matlabAcclMax);
-	Serial.print(" ");
-	Serial.print(matlabGyroMin);
 	Serial.print(" ");
 	Serial.println(matlabGyroMax);	
 
-	// Find min og max i accelerometerdata
-	double adataMax = maxInArray(acclPyt, bufferSize);
-	double adataMin = minInArray(acclPyt, bufferSize);
-	// Find min og max i gyroskop data
-	double gdataMax = maxInArray(gyroPyt, bufferSize);
-	double gdataMin = minInArray(gyroPyt, bufferSize);
-
-	Serial.print("Found min/max: ");
-	Serial.print(adataMin);
-	Serial.print(" ");
+	Serial.print("Found max: ");
 	Serial.print(adataMax);
-	Serial.print(" ");
-	Serial.print(gdataMin);
 	Serial.print(" ");
 	Serial.println(gdataMax);	
 
-	if ((int16_t)matlabAcclMin != (int16_t)adataMin) {
-		Serial.println("Accl min not equal!");
-	}
 	if ((int16_t)matlabAcclMax != (int16_t)adataMax) {
 		Serial.println("Accl max not equal!");
-	}
-	if ((int16_t)matlabGyroMin != (int16_t)gdataMin) {
-		Serial.println("Gyro min not equal!");
 	}
 	if ((int16_t)matlabGyroMax != (int16_t)gdataMax) {
 		Serial.println("Gyro max not equal!");
 	}
-
 	Serial.println("Done");
 
 
+	Serial.println("-----------------------------");
+	Serial.println("Tester normalisering af array...");
+	Serial.println("-----------------------------");
+
+	normalizeArray(acclPyt, bufferSize, adataMax);
+	normalizeArray(gyroPyt, bufferSize, gdataMax);
+
+	isSimilar(acclNorm, acclPyt, bufferSize);
+	isSimilar(gyroNorm, gyroPyt, bufferSize);
+	Serial.println("Done");
+
+
+	Serial.println("-----------------------------");
+	Serial.println("Tester FFT konvertering...");
+	Serial.println("-----------------------------");
+
+	getAbsoluteSingleFFT(acclPyt, acclSingleFFT, bufferSize);
+	getAbsoluteSingleFFT(gyroPyt, gyroSingleFFT, bufferSize);
+
+	setArrayTo(acclSingleFFT, 5, 0); 
+	setArrayTo(gyroSingleFFT, 5, 0); 
+
+	isSimilar(acclFFT, acclSingleFFT, singleSize);
+	isSimilar(gyroFFT, gyroSingleFFT, singleSize);
+	Serial.println("Done");
+
+
+	Serial.println("-----------------------------");
+	Serial.println("Tester FFT sum over og under 8 Hz...");
+	Serial.println("-----------------------------");
+
+	// Find sum under hzIndex og over hzIndex
+	double acclBelowSum = arraySum(acclSingleFFT, 0, fftIndexSummed);
+	double acclAboveSum = arraySum(acclSingleFFT, fftIndexSummed, singleSize);
+	double gyroBelowSum = arraySum(gyroSingleFFT, 0, fftIndexSummed);
+	double gyroAboveSum = arraySum(gyroSingleFFT, fftIndexSummed, singleSize);
+
+	double calculatedFFTsum[] = {
+		acclBelowSum, acclAboveSum, gyroBelowSum, gyroAboveSum
+	};
+
+	Serial.print("MATLAB summes (acclBelow, acclAbove, gyroBelow, gyroAbove): ");
+	Serial.print(summedFFT[0]);
+	Serial.print(" ");
+	Serial.print(summedFFT[1]);
+	Serial.print(" ");
+	Serial.print(summedFFT[2]);
+	Serial.print(" ");
+	Serial.println(summedFFT[3]);	
+
+	Serial.print("Found summes (acclBelow, acclAbove, gyroBelow, gyroAbove): ");
+	Serial.print(calculatedFFTsum[0]);
+	Serial.print(" ");
+	Serial.print(calculatedFFTsum[1]);
+	Serial.print(" ");
+	Serial.print(calculatedFFTsum[2]);
+	Serial.print(" ");
+	Serial.println(calculatedFFTsum[3]);	
+
+	isSimilar(summedFFT, calculatedFFTsum, 4);
+	Serial.println("Done");
+
+
+	Serial.println("-----------------------------");
+	Serial.println("Tjekker aktivitet...");
+	Serial.println("-----------------------------");
+
+	// Gæt aktivitet baseret på FFT
+	uint8_t activity = estimateActivity(&calculatedFFTsum[0], &calculatedFFTsum[1], &calculatedFFTsum[2], &calculatedFFTsum[3]);
+	Serial.println("Done");
+
+
+	Serial.println("-----------------------------");
+	Serial.println("Tjekker find peaks...");
+	Serial.println("-----------------------------");
+
+	uint16_t peakCount = 0;
+	// Find peaks i data
+	switch (activity) {
+		case RUN_WALK: {
+			peakCount = findPeaksInArray(acclPyt, bufferSize, acclPeakThreshold, acclPeakTimeout);
+		} break;
+		case BIKE: {
+			peakCount = findPeaksInArray(gyroPyt, bufferSize, gyroPeakThreshold, gyroPeakTimeout);
+		} break;
+	}
+	Serial.print("MATLAB peaks: ");
+	Serial.println(matlabPeaks);
+	Serial.print("Peaks fundet: ");
+	Serial.println(peakCount);
+
+	if (matlabPeaks != peakCount) {
+		Serial.println("Peak detektion ukorrekt!");
+	} else {
+		Serial.println("Peak detektion korrekt!");
+	}
+	Serial.println("Done");
+
+
+	Serial.println("-----------------------------");
+	Serial.println("Tjekker aktivitetSpeficier...");
+	Serial.println("-----------------------------");
+
+	// Korriger aktivitet
+	activity = specifyActivity(activity, peakCount);
+	
+	Serial.println("Done");
 
 }
 
